@@ -204,8 +204,6 @@ def bmm_w8a8(
         raise TypeError("scales must be contiguous FP32 tensors")
     if any(scale.requires_grad for scale in (activation_scale, weight_scale)):
         raise NotImplementedError("bmm_w8a8 is forward-only")
-    if reduction > MAX_INT32_REDUCTION:
-        raise NotImplementedError("reduction may overflow signed INT32 accumulation")
     if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError("output dtype must be bfloat16, float16 or float32")
     if out is None:
@@ -227,6 +225,8 @@ def bmm_w8a8(
         raise ValueError("out must not share storage with an input")
     if out.numel() == 0:
         return out
+    if reduction > MAX_INT32_REDUCTION:
+        raise NotImplementedError("reduction may overflow signed INT32 accumulation")
     with torch_device_fn.device(activation.device):
         if reduction == 0:
             return zero_(out)

@@ -9,7 +9,7 @@ import torch
 import flag_gems
 from benchmark.test_bmm_w8a8 import make_channel_int8_bmm_inputs
 
-from .accuracy_utils import gems_assert_close
+from .accuracy_utils import gems_assert_close, gems_assert_equal
 
 CONTRACT_SHAPES = [
     (1, 1, 1, 1),
@@ -38,13 +38,13 @@ requires_channel_int8_bmm = pytest.mark.skipif(
 @pytest.mark.bmm_w8a8
 @requires_channel_int8_bmm
 def test_channel_int8_bmm(shape, dtype, scale_rank, use_out):
-    batch, rows, columns, reduction = shape
+    batch, rows, columns = shape[:3]
     activation, weight, activation_scale, weight_scale = make_channel_int8_bmm_inputs(
         shape, flag_gems.device
     )
-    reference = torch.bmm(activation.float(), weight.float())
-    reference *= activation_scale[:, :, None]
-    reference *= weight_scale[:, None, :]
+    reference = torch.bmm(activation.cpu().long(), weight.cpu().long()).float()
+    reference *= activation_scale.cpu()[:, :, None]
+    reference *= weight_scale.cpu()[:, None, :]
     activation_scale = (
         activation_scale[:, :, None] if scale_rank == 3 else activation_scale
     )
@@ -57,12 +57,12 @@ def test_channel_int8_bmm(shape, dtype, scale_rank, use_out):
     actual = flag_gems.bmm_w8a8(
         activation, weight, activation_scale, weight_scale, out_dtype=dtype, out=output
     )
-    gems_assert_close(actual, reference.to(dtype), dtype, reduce_dim=reduction)
+    gems_assert_close(actual.cpu(), reference.to(dtype), dtype, atol=0)
 
 
 @pytest.mark.parametrize("use_out", [False, True])
 @pytest.mark.parametrize(
-    "shape", [(0, 5, 7, 32), (2, 0, 7, 32), (2, 5, 0, 32), (2, 5, 7, 0)]
+    "shape", [(0, 5, 7, 131072), (2, 0, 7, 32), (2, 5, 0, 32), (2, 5, 7, 0)]
 )
 @pytest.mark.bmm_w8a8
 @requires_channel_int8_bmm
@@ -89,4 +89,4 @@ def test_channel_int8_bmm_empty(shape, use_out):
     reference = torch.zeros(
         (batch, rows, columns), device=activation.device, dtype=torch.bfloat16
     )
-    gems_assert_close(actual, reference, torch.bfloat16)
+    gems_assert_equal(actual, reference)
