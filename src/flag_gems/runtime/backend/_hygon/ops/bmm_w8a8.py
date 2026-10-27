@@ -11,6 +11,8 @@ from flag_gems.ops.zeros import zero_
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
+from .mm_w8a8_int8 import _grouped_int8, _launch_prequantized
+
 logger = logging.getLogger(__name__)
 
 MAX_INT32_REDUCTION = (2**31 - 1) // (128 * 128)
@@ -230,6 +232,46 @@ def bmm_w8a8(
     with torch_device_fn.device(activation.device):
         if reduction == 0:
             return zero_(out)
+        if batch == 1 and rows <= 64 and columns == 1024 and reduction == 4096:
+            if rows in (16, 24, 32) or rows > 32:
+                block_m = 32 if rows > 32 else 16
+                _grouped_int8[
+                    (triton.cdiv(rows, block_m) * triton.cdiv(columns, 16),)
+                ](
+                    activation,
+                    weight,
+                    activation_scale,
+                    weight_scale,
+                    out,
+                    rows,
+                    columns,
+                    reduction,
+                    block_m,
+                    16,
+                    256,
+                    2,
+                    0,
+                    Bias=None,
+                    HAS_BIAS=False,
+                    A_SCALAR=False,
+                    B_SCALAR=False,
+                    enable_fp_fusion=False,
+                    num_warps=2,
+                    num_stages=2,
+                )
+                return out
+            # Validated B=1 layouts already match the MM kernel's flat storage.
+            return _launch_prequantized(
+                activation,
+                weight,
+                activation_scale,
+                weight_scale,
+                out,
+                rows,
+                columns,
+                reduction,
+                None,
+            )
         config = _get_int8_config(batch, rows, columns, reduction)
         block_m, block_n = config["BLOCK_M"], config["BLOCK_N"]
         block_k = config["TILE_K"] or min(
