@@ -232,11 +232,17 @@ def bmm_w8a8(
     with torch_device_fn.device(activation.device):
         if reduction == 0:
             return zero_(out)
-        if batch == 1 and rows <= 64 and columns == 1024 and reduction == 4096:
+        if (
+            batch == 1
+            and (rows <= 64 or 72 <= rows <= 160)
+            and columns == 1024
+            and reduction == 4096
+        ):
             if rows in (16, 24, 32) or rows > 32:
                 block_m = 32 if rows > 32 else 16
+                block_n = 32 if rows >= 72 else 16
                 _grouped_int8[
-                    (triton.cdiv(rows, block_m) * triton.cdiv(columns, 16),)
+                    (triton.cdiv(rows, block_m) * triton.cdiv(columns, block_n),)
                 ](
                     activation,
                     weight,
@@ -247,7 +253,7 @@ def bmm_w8a8(
                     columns,
                     reduction,
                     block_m,
-                    16,
+                    block_n,
                     256,
                     2,
                     0,
