@@ -28,7 +28,7 @@ EXACT_CONFIGS = {
 }
 
 
-def _get_int8_config(batch, m, n, k, scale_n=128):
+def _get_int8_config(batch, m, n, k):
     key = (batch, m, n, k)
     acc_fp32, swap_ab, tile_k, unroll = False, False, None, 1
     if key in EXACT_CONFIGS:
@@ -40,7 +40,9 @@ def _get_int8_config(batch, m, n, k, scale_n=128):
         )[:9]
     elif n == 1024 and k >= 4096:
         if batch == 1:
-            if m <= 32:
+            if k == 4096 and (4096 <= m <= 5120 or m >= 12288):
+                bm, bn, warps, stages, group = 128, 256, 4, 1, 4
+            elif m <= 32:
                 bm, bn, warps, stages, group = 16, 32, 4, 2, 1
             elif m <= 224:
                 bm, bn, warps, stages, group = 32, 32, 4, 2, 1
@@ -64,6 +66,8 @@ def _get_int8_config(batch, m, n, k, scale_n=128):
     elif n >= 2048 and m >= 128:
         if k <= 256:
             bm, bn, warps, stages, group = 64, 64, 4, 2, 1
+        elif m >= 12288 and n >= 4096 and n % 256 == 0 and k <= 1024:
+            bm, bn, warps, stages, group = 128, 256, 4, 1, 8
         else:
             bm, bn, warps, stages = 128, 128, 4, 2
             group = 8 if n >= 4096 else 1
@@ -75,7 +79,7 @@ def _get_int8_config(batch, m, n, k, scale_n=128):
         bm, bn, warps, stages, group = 64, 64, 4, 2, 4
     result = dict(
         BLOCK_M=bm,
-        BLOCK_N=min(bn, scale_n),
+        BLOCK_N=bn,
         num_warps=warps,
         num_stages=stages,
         GROUP_M=group,
@@ -234,14 +238,31 @@ def bmm_w8a8(
             return zero_(out)
         if (
             batch == 1
-            and (rows <= 64 or 72 <= rows <= 160)
+            and (rows <= 64 or 72 <= rows <= 512)
             and columns == 1024
             and reduction == 4096
         ):
             if rows in (16, 24, 32) or rows > 32:
-                block_m = 32 if rows > 32 else 16
-                block_n = 32 if rows >= 72 else 16
-                _grouped_int8[
+                if rows > 224:
+                    config = _get_int8_config(batch, rows, columns, reduction)
+                    block_m, block_n = config["BLOCK_M"], config["BLOCK_N"]
+                    block_k = 2 * (config["TILE_K"] or 128)
+                    warps, stages = config["num_warps"], config["num_stages"]
+                    group_m = config["GROUP_M"]
+                else:
+                    block_m = 32 if rows > 32 else 16
+                    block_n = 32 if rows >= 72 else 16
+                    block_k, stages, group_m = 256, 2, 0
+                    warps = 4 if 72 <= rows <= 160 else 2
+                grouped_kernel = (
+                    _parallel_grouped_int8 if 72 <= rows <= 512 else _grouped_int8
+                )
+                epilogue = (
+                    dict(Bias=None, HAS_BIAS=False, A_SCALAR=False, B_SCALAR=False)
+                    if rows < 72
+                    else {}
+                )
+                grouped_kernel[
                     (triton.cdiv(rows, block_m) * triton.cdiv(columns, block_n),)
                 ](
                     activation,
@@ -254,16 +275,13 @@ def bmm_w8a8(
                     reduction,
                     block_m,
                     block_n,
-                    256,
-                    2,
-                    0,
-                    Bias=None,
-                    HAS_BIAS=False,
-                    A_SCALAR=False,
-                    B_SCALAR=False,
+                    block_k,
+                    stages,
+                    group_m,
                     enable_fp_fusion=False,
-                    num_warps=2,
-                    num_stages=2,
+                    num_warps=warps,
+                    num_stages=stages,
+                    **epilogue,
                 )
                 return out
             # Validated B=1 layouts already match the MM kernel's flat storage.
@@ -312,3 +330,72 @@ def bmm_w8a8(
             num_stages=config["num_stages"],
         )
     return out
+
+
+@libentry()
+@triton.jit
+def _parallel_grouped_int8(
+    A,
+    B,
+    SA,
+    SB,
+    C,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    ST: tl.constexpr,
+    GROUP: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    pm = tl.cdiv(M, BM)
+    pn = tl.cdiv(N, BN)
+    if GROUP == 0:
+        im = pid % pm
+        jn = pid // pm
+    else:
+        group = pid // (GROUP * pn)
+        first = group * GROUP
+        size = tl.minimum(pm - first, GROUP)
+        im = first + pid % size
+        jn = (pid % (GROUP * pn)) // size
+    rm = im * BM + tl.arange(0, BM)
+    rn = jn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK // 2)
+    acc0 = tl.zeros((BM, BN), tl.int32)
+    acc1 = tl.zeros((BM, BN), tl.int32)
+    for start in tl.range(0, tl.cdiv(K, BK), num_stages=ST):
+        k0 = start * BK + rk
+        k1 = BK // 2 + k0
+        a0 = tl.load(
+            A + rm[:, None] * K + k0[None, :],
+            (rm[:, None] < M) & (k0[None, :] < K),
+            other=0,
+        )
+        b0 = tl.load(
+            B + rn[None, :] * K + k0[:, None],
+            (rn[None, :] < N) & (k0[:, None] < K),
+            other=0,
+        )
+        a1 = tl.load(
+            A + rm[:, None] * K + k1[None, :],
+            (rm[:, None] < M) & (k1[None, :] < K),
+            other=0,
+        )
+        b1 = tl.load(
+            B + rn[None, :] * K + k1[:, None],
+            (rn[None, :] < N) & (k1[:, None] < K),
+            other=0,
+        )
+        acc0 = tl.dot(a0, b0, acc0, out_dtype=tl.int32)
+        acc1 = tl.dot(a1, b1, acc1, out_dtype=tl.int32)
+    acc = acc0 + acc1
+    sa = tl.load(SA + rm, rm < M, other=0)
+    sb = tl.load(SB + rn, rn < N, other=0)
+    tl.store(
+        C + rm[:, None] * N + rn[None, :],
+        acc.to(tl.float32) * sa[:, None] * sb[None, :],
+        (rm[:, None] < M) & (rn[None, :] < N),
+    )
