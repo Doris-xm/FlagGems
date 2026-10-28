@@ -103,4 +103,4 @@ def test_channel_int8_bmm_empty(shape, use_out):
     reference = torch.zeros(
         (batch, rows, columns), device=activation.device, dtype=torch.bfloat16
     )
-    gems_assert_equal(actual, reference)
+    gems_assert_equal(actual.cpu(), reference.cpu())
